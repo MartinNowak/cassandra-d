@@ -57,10 +57,10 @@ import cassandra.internal.tcpconnection;
  *
  *  The CQL binary protocol is a frame based protocol. Frames are defined as:
  *
- *      0         8        16        24        32
- *      +---------+---------+---------+---------+
- *      | version |  flags  | stream  | opcode  |
- *      +---------+---------+---------+---------+
+ *      0         8        16        24        32         40
+ *      +---------+---------+---------+---------+---------+
+ *      | version |  flags  |      stream       | opcode  |
+ *      +---------+---------+---------+---------+---------+
  *      |                length                 |
  *      +---------+---------+---------+---------+
  *      |                                       |
@@ -71,18 +71,16 @@ import cassandra.internal.tcpconnection;
  *
  *  The protocol is big-endian (network byte order).
  *
- *  Each frame contains a fixed size header (8 bytes) followed by a variable size
+ *  Each frame contains a fixed size header (9 bytes) followed by a variable size
  *  body. The header is described in Section 2. The content of the body depends
  *  on the header opcode value (the body can in particular be empty for some
- *  opcode values). The list of allowed opcode is defined Section 2.3 and the
+ *  opcode values). The list of allowed opcode is defined Section 2.4 and the
  *  details of each corresponding message is described Section 4.
  *
  *  The protocol distinguishes 2 types of frames: requests and responses. Requests
  *  are those frame sent by the clients to the server, response are the ones sent
- *  by the server. Note however that while communication are initiated by the
- *  client with the server responding to request, the protocol may likely add
- *  server pushes in the future, so responses does not obligatory come right after
- *  a client request.
+ *  by the server. Note however that the protocol supports server pushes (events)
+ *  so responses does not necessarily come right after a client request.
  *
  *  Note to client implementors: clients library should always assume that the
  *  body of a given frame may contain more data than what is described in this
@@ -116,7 +114,11 @@ package struct FrameHeader {
 		V1Request = 0x01,
 		V1Response =  0x81,
 		V2Request = 0x02,
-		V2Response = 0x82
+		V2Response = 0x82,
+		V3Request = 0x03,
+		V3Response = 0x83,
+		V4Request = 0x04,
+		V4Response = 0x84,
 	}
 	Version version_;
 
@@ -142,11 +144,15 @@ package struct FrameHeader {
 	 *
 	 *  The rest of the flags is currently unused and ignored.
 	 */
-	mixin(bitfields!(
-		bool,"compress", 1,
-		bool,"trace", 1,
-		uint, "", 6
-		));
+	union
+	{
+		mixin(bitfields!(
+				  bool,"compress", 1,
+				  bool,"trace", 1,
+				  uint, "", 6
+			  ));
+		ubyte flags;
+	}
 	bool hasTracing() { if (this.trace) return true; return false; }
 
 	/**2.3. stream
@@ -173,7 +179,7 @@ package struct FrameHeader {
 	 *  the 128 maximum possible stream ids if it is simpler for those
 	 *  implementation.
 	 */
-	byte streamid; bool isServerStream() { if (streamid < 0) return true; return false; } bool isEvent() { if (streamid==-1) return true; return false;}
+	short streamid; bool isServerStream() { if (streamid < 0) return true; return false; } bool isEvent() { if (streamid==-1) return true; return false;}
 
 	/**2.4. opcode
 	 *
@@ -237,16 +243,28 @@ package struct FrameHeader {
 
 	ubyte[] bytes() {
 		import std.bitmanip : write;
-		import std.array : appender;
-		auto buffer = appender!(ubyte[])();
-		foreach (i,v; this.tupleof) {
-			if (is( typeof(v) : int )) {
-				ubyte[] buf = [0,0,0,0,0,0,0,0];
-				buf.write!(typeof(v))(v, 0);
-				buffer.put(buf[0..typeof(v).sizeof]);
-			}
+
+		ubyte[9] buf = void;
+		size_t idx;
+		buf[idx .. $].write(version_, 0);
+		idx += version_.sizeof;
+		buf[idx .. $].write(flags, 0);
+		idx += flags.sizeof;
+		if ((version_ & 0xF) < FrameHeader.Version.V3Request)
+		{
+			buf[idx .. $].write(cast(ubyte) streamid, 0);
+			idx += ubyte.sizeof;
 		}
-		return buffer.data;
+		else
+		{
+			buf[idx .. $].write(streamid, 0);
+			idx += streamid.sizeof;
+		}
+		buf[idx .. $].write(opcode, 0);
+		idx += opcode.sizeof;
+		buf[idx .. $].write(length, 0);
+		idx += length.sizeof;
+		return buf[0 .. idx].dup;
 	}
 }
 
@@ -273,7 +291,21 @@ package FrameHeader readFrameHeader(TCPConnection s, ref int counter) {
 	auto fh = FrameHeader();
 	fh.version_ = cast(FrameHeader.Version)readByte(s, counter);
 	readByte(s, counter); // FIXME: this should load into flags
-	fh.streamid = readByte(s, counter);
+	switch (fh.version_)
+	{
+	case FrameHeader.Version.V1Response:
+	case FrameHeader.Version.V2Response:
+		fh.streamid = readByte(s, counter);
+		break;
+	case FrameHeader.Version.V3Response:
+	case FrameHeader.Version.V4Response:
+		fh.streamid = readShort(s, counter);
+		break;
+	default:
+		import std.string : format;
+		enforce(false, "Unknown FrameHeader version %#x in response.".format(fh.version_));
+		break;
+	}
 	fh.opcode = cast(FrameHeader.OpCode)readByte(s, counter);
 	readIntNotNULL(fh.length, s, counter);
 
@@ -453,19 +485,19 @@ package void appendIntBytes(T, R)(R appender, T data)
 	} else static if (isArray!T) {
 		assert(data.length < uint.max);
 		auto tmpapp = std.array.appender!(ubyte[])();
-		tmpapp.appendRawBytes(cast(ushort)data.length);
+		tmpapp.appendRawBytes(cast(uint)data.length);
 		foreach (item; data) {
-			assert(item.length < ushort.max);
-			tmpapp.appendShortBytes(item);
+			assert(item.length < uint.max);
+			tmpapp.appendIntBytes(item);
 		}
 		appender.appendIntBytes(tmpapp.data);
 	} else static if (isAssociativeArray!T) {
 		assert(data.length < uint.max);
 		auto tmpapp = std.array.appender!(ubyte[])();
-		tmpapp.appendRawBytes(cast(ushort)data.length);
+		tmpapp.appendRawBytes(cast(uint)data.length);
 		foreach (key,value; data) {
-			tmpapp.appendShortBytes(key);
-			tmpapp.appendShortBytes(value);
+			tmpapp.appendIntBytes(key);
+			tmpapp.appendIntBytes(value);
 		}
 		appender.appendIntBytes(tmpapp.data);
 	} else static if (isIntegral!T || is(T == double) || is(T == float) || is(T == ushort)) {
@@ -601,7 +633,7 @@ enum Consistency : ushort  {
 /**
  *    [string map]      A [short] n, followed by n pair <k><v> where <k> and <v> are [string].
  */
-alias string[string] StringMap;
+struct StringMap { string[string] _p; alias _p this; }
 
 package void append(R, Args...)(R appender, Args args)
 	if (isOutputRange!(R, ubyte))
@@ -660,13 +692,26 @@ package void appendOverride(R)(R appender, StringMap sm)
 	if (isOutputRange!(R, ubyte))
 {
 	assert(sm.length < short.max);
-
 	appender.append(cast(short)sm.length);
+
 	foreach (k,v; sm) {
 		appender.append(k);
 		appender.append(v);
 	}
 }
+package void appendOverride(R)(R appender, string[string] sm)
+	if (isOutputRange!(R, ubyte))
+{
+	assert(sm.length < int.max);
+	appender.append(cast(int)sm.length);
+
+	foreach (k,v; sm) {
+		appender.append(k);
+		appender.append(v);
+	}
+	static assert(0, "");
+}
+
 package void appendOverride(R)(R appender, Consistency c)
 	if (isOutputRange!(R, ubyte))
 {
@@ -681,13 +726,13 @@ package void appendOverride(R)(R appender, bool b)
 	else
 		appender.append(cast(int)0x00000000);
 }
-package void appendOverride(R)(R appender, string[] strs)
-	if (isOutputRange!(R, ubyte))
-{
-	foreach (str; strs) {
-		appender.append(str);
-	}
-}
+//package void appendOverride(R)(R appender, string[] strs)
+//	if (isOutputRange!(R, ubyte))
+//{
+//	foreach (str; strs) {
+//		appender.append(str);
+//	}
+//}
 
 /*auto append(Appender!(ubyte[]) appender, ubyte[] data) {
 	appender.put(data);

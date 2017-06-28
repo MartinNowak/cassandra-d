@@ -35,8 +35,8 @@ class Connection {
 
 		bool m_compressionEnabled;
 		bool m_tracingEnabled;
-		byte m_streamID;
-		FrameHeader.Version m_transportVersion; // this is just the protocol version number
+		short m_streamID;
+		FrameHeader.Version m_transportVersion = FrameHeader.Version.V3Request;
 	}
 
 	enum defaultPort = 9042;
@@ -83,11 +83,7 @@ class Connection {
 	/// Make a FrameHeader corresponding to this Stream
 	FrameHeader makeHeader(FrameHeader.OpCode opcode) {
 		FrameHeader fh;
-		switch (m_transportVersion) {
-			case 1: fh.version_ = FrameHeader.Version.V1Request; break;
-			case 2: fh.version_ = FrameHeader.Version.V2Request; break;
-			default: assert(0, "invalid transport_version");
-		}
+		fh.version_ = m_transportVersion;
 		fh.compress = m_compressionEnabled;
 		fh.trace = m_tracingEnabled;
 		fh.streamid = m_streamID;
@@ -106,7 +102,7 @@ class Connection {
 	 *
 	 *  Initialize the connection. The server will respond by either a READY message
 	 *  (in which case the connection is ready for queries) or an AUTHENTICATE message
-	 *  (in which case credentials will need to be provided using CREDENTIALS).
+	 *  (in which case credentials will need to be provided using AUTH_RESPONSE).
 	 *
 	 *  This must be the first message of the connection, except for OPTIONS that can
 	 *  be sent before to find out the options supported by the server. Once the
@@ -150,19 +146,23 @@ class Connection {
 
 
 	/**
-	 *4.1.2. CREDENTIALS
+	 *4.1.2. AUTH_RESPONSE
 	 *
-	 *  Provides credentials information for the purpose of identification. This
-	 *  message comes as a response to an AUTHENTICATE message from the server, but
-	 *  can be use later in the communication to change the authentication
-	 *  information.
+	 *  Answers a server authentication challenge.
 	 *
-	 *  The body is a list of key/value informations. It is a [short] n, followed by n
-	 *  pair of [string]. These key/value pairs are passed as is to the Cassandra
-	 *  IAuthenticator and thus the detail of which informations is needed depends on
-	 *  that authenticator.
+	 *  Authentication in the protocol is SASL based. The server sends authentication
+	 *  challenges (a bytes token) to which the client answer with this message. Those
+	 *  exchanges continue until the server accepts the authentication by sending a
+	 *  AUTH_SUCCESS message after a client AUTH_RESPONSE. It is however that client that
+	 *  initiate the exchange by sending an initial AUTH_RESPONSE in response to a
+	 *  server AUTHENTICATE request.
 	 *
-	 *  The response to a CREDENTIALS is a READY message (or an ERROR message).
+	 *  The body of this message is a single [bytes] token. The details of what this
+	 *  token contains (and when it can be null/empty, if ever) depends on the actual
+	 *  authenticator used.
+	 *
+	 *  The response to a AUTH_RESPONSE is either a follow-up AUTH_CHALLENGE message,
+	 *  an AUTH_SUCCESS message or an ERROR message.
 	 */
 	private void sendCredentials(StringMap data) {
 		auto fh = makeHeader(FrameHeader.OpCode.credentials);
@@ -171,7 +171,7 @@ class Connection {
 		fh.length = bytebuf.getIntLength;
 		sock.write(fh.bytes);
 		sock.write(bytebuf.data);
-		
+
 		assert(false, "todo: read credentials response");
 	}
 
@@ -193,11 +193,59 @@ class Connection {
 		return readSupported(fh);
 	}
 
-	 /**
+	/**
 	 *4.1.4. QUERY
 	 *
-	 *  Performs a CQL query. The body of the message consists of a CQL query as a [long
-	 *  string] followed by the [consistency] for the operation.
+	 *  Performs a CQL query. The body of the message must be:
+	 *    <query><query_parameters>
+	 *  where <query> is a [long string] representing the query and
+	 *  <query_parameters> must be
+	 *    <consistency><flags>[<n>[name_1]<value_1>...[name_n]<value_n>][<result_page_size>][<paging_state>][<serial_consistency>][<timestamp>]
+	 *  where:
+	 *    - <consistency> is the [consistency] level for the operation.
+	 *    - <flags> is a [byte] whose bits define the options for this query and
+	 *      in particular influence what the remainder of the message contains.
+	 *      A flag is set if the bit corresponding to its `mask` is set. Supported
+	 *      flags are, given there mask:
+	 *        0x01: Values. In that case, a [short] <n> followed by <n> [bytes]
+	 *              values are provided. Those value are used for bound variables in
+	 *              the query. Optionally, if the 0x40 flag is present, each value
+	 *              will be preceded by a [string] name, representing the name of
+	 *              the marker the value must be binded to. This is optional, and
+	 *              if not present, values will be binded by position.
+	 *        0x02: Skip_metadata. If present, the Result Set returned as a response
+	 *              to that query (if any) will have the NO_METADATA flag (see
+	 *              Section 4.2.5.2).
+	 *        0x04: Page_size. In that case, <result_page_size> is an [int]
+	 *              controlling the desired page size of the result (in CQL3 rows).
+	 *              See the section on paging (Section 8) for more details.
+	 *        0x08: With_paging_state. If present, <paging_state> should be present.
+	 *              <paging_state> is a [bytes] value that should have been returned
+	 *              in a result set (Section 4.2.5.2). If provided, the query will be
+	 *              executed but starting from a given paging state. This also to
+	 *              continue paging on a different node from the one it has been
+	 *              started (See Section 8 for more details).
+	 *        0x10: With serial consistency. If present, <serial_consistency> should be
+	 *              present. <serial_consistency> is the [consistency] level for the
+	 *              serial phase of conditional updates. That consitency can only be
+	 *              either SERIAL or LOCAL_SERIAL and if not present, it defaults to
+	 *              SERIAL. This option will be ignored for anything else that a
+	 *              conditional update/insert.
+	 *        0x20: With default timestamp. If present, <timestamp> should be present.
+	 *              <timestamp> is a [long] representing the default timestamp for the query
+	 *              in microseconds (negative values are discouraged but supported for
+	 *              backward compatibility reasons except for the smallest negative
+	 *              value (-2^63) that is forbidden). If provided, this will
+	 *              replace the server side assigned timestamp as default timestamp.
+	 *              Note that a timestamp in the query itself will still override
+	 *              this timestamp. This is entirely optional.
+	 *        0x40: With names for values. This only makes sense if the 0x01 flag is set and
+	 *              is ignored otherwise. If present, the values from the 0x01 flag will
+	 *              be preceded by a name (see above). Note that this is only useful for
+	 *              QUERY requests where named bind markers are used; for EXECUTE statements,
+	 *              since the names for the expected values was returned during preparation,
+	 *              a client can always provide values in the right order without any names
+	 *              and using this flag, while supported, is almost surely inefficient.
 	 *
 	 *  Note that the consistency is ignored by some queries (USE, CREATE, ALTER,
 	 *  TRUNCATE, ...).
@@ -216,6 +264,8 @@ class Connection {
 		//print(bytebuf.data);
 		log("-----------");
 		bytebuf.append(consistency);
+		if ((m_transportVersion) >= FrameHeader.Version.V3Request)
+			bytebuf.append(0); // flags
 		fh.length = bytebuf.getIntLength;
 		sock.write(fh.bytes);
 		sock.write(bytebuf.data);
@@ -228,15 +278,16 @@ class Connection {
 	}
 
 	 /**
-	 *4.1.5. PREPARE
-	 *
-	 *  Prepare a query for later execution (through EXECUTE). The body consists of
-	 *  the CQL query to prepare as a [long string].
-	 *
-	 *  The server will respond with a RESULT message with a `prepared` kind (0x0004,
-	 *  see Section 4.2.5).
+	  *4.1.5. PREPARE
+	  *
+	  *  Prepare a query for later execution (through EXECUTE). The body consists of
+	  *  the CQL query to prepare as a [long string].
+	  *
+	  *  The server will respond with a RESULT message with a `prepared` kind (0x0004,
+	  *  see Section 4.2.5).
 	 */
-	PreparedStatement prepare(string q) {
+	PreparedStatement prepare(string q)
+	{
 		connect();
 		auto fh = makeHeader(FrameHeader.OpCode.prepare);
 		auto bytebuf = appender!(ubyte[])();
@@ -260,17 +311,10 @@ class Connection {
 	 *4.1.6. EXECUTE
 	 *
 	 *  Executes a prepared query. The body of the message must be:
-	 *    <id><n><value_1>....<value_n><consistency>
-	 *  where:
-	 *    - <id> is the prepared query ID. It's the [short bytes] returned as a
-	 *      response to a PREPARE message.
-	 *    - <n> is a [short] indicating the number of following values.
-	 *    - <value_1>...<value_n> are the [bytes] to use for bound variables in the
-	 *      prepared query.
-	 *    - <consistency> is the [consistency] level for the operation.
-	 *
-	 *  Note that the consistency is ignored by some (prepared) queries (USE, CREATE,
-	 *  ALTER, TRUNCATE, ...).
+	 *    <id><query_parameters>
+	 *  where <id> is the prepared query ID. It's the [short bytes] returned as a
+	 *  response to a PREPARE message. As for <query_parameters>, it has the exact
+	 *  same definition than in QUERY (see Section 4.1.4).
 	 *
 	 *  The response from the server will be a RESULT message.
 	 */

@@ -117,10 +117,10 @@ struct CassandraResult {
 		m_fh = fh;
 		m_sock = sock;
 		m_counterP = &counter;
-		
+
 		int tmp;
 		m_kind = cast(Kind)readIntNotNULL(tmp, sock, m_counter);
-		
+
 		final switch (m_kind) {
 			case Kind.void_: readVoid(); break;
 			case Kind.rows:
@@ -477,10 +477,22 @@ struct PreparedStatement {
 		 *4.2.5.4. Prepared
 		 *
 		 *  The result to a PREPARE message. The rest of the body of a Prepared result is:
-		 *    <id><metadata>
+		 *    <id><metadata><result_metadata>
 		 *  where:
 		 *    - <id> is [short bytes] representing the prepared query ID.
-		 *    - <metadata> is defined exactly as for a Rows RESULT (See section 4.2.5.2).
+		 *    - <metadata> is defined exactly as for a Rows RESULT (See section 4.2.5.2; you
+		 *      can however assume that the Has_more_pages flag is always off) and
+		 *      is the specification for the variable bound in this prepare statement.
+		 *    - <result_metadata> is defined exactly as <metadata> but correspond to the
+		 *      metadata for the resultSet that execute this query will yield. Note that
+		 *      <result_metadata> may be empty (have the No_metadata flag and 0 columns, See
+		 *      section 4.2.5.2) and will be for any query that is not a Select. There is
+		 *      in fact never a guarantee that this will non-empty so client should protect
+		 *      themselves accordingly. The presence of this information is an
+		 *      optimization that allows to later execute the statement that has been
+		 *      prepared without requesting the metadata (Skip_metadata flag in EXECUTE).
+		 *      Clients can safely discard this metadata if they do not want to take
+		 *      advantage of that optimization.
 		 *
 		 *  Note that prepared query ID return is global to the node on which the query
 		 *  has been prepared. It can be used on any connection to that node and this
@@ -491,6 +503,7 @@ struct PreparedStatement {
 		m_id = readShortBytes(result.m_sock, result.m_counter);
 		log("reading metadata");
 		/*m_metadata =*/ result.readRowMetaData();
+		/*m_resultMetadata =*/ result.readRowMetaData();
 		log("done reading prepared stmt");
 	}
 
